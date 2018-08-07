@@ -3,19 +3,21 @@ package haystack
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/cespare/xxhash"
 	"hash"
 	"hash/fnv"
 	"io"
 	"os"
+
+	"github.com/cespare/xxhash"
 )
 
+// Haystack is the structure that defines the haystack database
 type Haystack struct {
 	indexFile *os.File
 	dataFile  *os.File
 	needles   []needleIndex
 
-	needlesMap map[uint64]needleIndex
+	needlesMap map[uint64]*needleIndex
 	// TODO: add a mutex to protect the map
 }
 
@@ -24,9 +26,11 @@ type needleIndex struct {
 	flags  uint64
 	offset int64
 	size   int64
+
+	indexOffset int64
 }
 
-// TODO: do we need cookies? Facebook has them for security reasons
+// Needle is the struct given to access the Haystack data
 type Needle struct {
 	Key uint64
 	//altKey uint64
@@ -59,7 +63,9 @@ Padding: Total needle size is aligned to 8 bytes
 */
 
 const (
+	// REMOVED marks a needle as removed
 	REMOVED = 1 << iota
+	// PARTIAL marks a needle as being created
 	PARTIAL
 	//COMPRESSED
 )
@@ -72,6 +78,7 @@ const needleIndexLen = 8 + 8 + 8 + 8
 const needleHeaderLen = 4 + 8 + 8 + 8
 const needleFooterLen = 4 + 8 // footer has padding after
 
+// NewHaystack creates a new Haystack, tries to recover index if it doesn't exist
 func NewHaystack(stackFile string) (*Haystack, error) {
 	indexFile := stackFile + ".idx"
 
@@ -92,7 +99,7 @@ func NewHaystack(stackFile string) (*Haystack, error) {
 	}
 
 	needles := make([]needleIndex, 0)
-	needlesMap := make(map[uint64]needleIndex)
+	needlesMap := make(map[uint64]*needleIndex)
 	for pos := int64(0); pos < fi.Size(); pos += needleIndexLen {
 		if err != nil {
 			f.Close()
@@ -105,13 +112,17 @@ func NewHaystack(stackFile string) (*Haystack, error) {
 			return nil, err
 		}
 
+		ni.indexOffset = pos
+
 		// TODO: free list implementation
 		if ni.flags&REMOVED != REMOVED {
+			// skip partial needles if a needle with the same key already exists
 			if _, exists := needlesMap[ni.key]; exists {
-				f.Close()
-				return nil, fmt.Errorf("key %v already exists in needles map", ni.key)
+				if ni.flags&PARTIAL == PARTIAL {
+					continue
+				}
 			}
-			needlesMap[ni.key] = ni
+			needlesMap[ni.key] = &ni
 		}
 
 		needles = append(needles, ni)
@@ -148,6 +159,7 @@ func readNeedleIndex(f *os.File) (ni needleIndex, err error) {
 	return
 }
 
+// Find searches for a Needle in the Haystack
 func (hs *Haystack) Find(filename string) (*Needle, error) {
 	keyH := fnv.New64a()
 	if _, err := keyH.Write([]byte(filename)); err != nil {
@@ -156,6 +168,7 @@ func (hs *Haystack) Find(filename string) (*Needle, error) {
 	return hs.FindKey(keyH.Sum64())
 }
 
+// FindKey searches for a Needle in the Haystack by a specific key
 func (hs *Haystack) FindKey(key uint64) (*Needle, error) {
 	needleIndex, ok := hs.needlesMap[key]
 	if !ok {
@@ -166,7 +179,7 @@ func (hs *Haystack) FindKey(key uint64) (*Needle, error) {
 }
 
 // TODO: concurrent reader support?
-func (hs *Haystack) readNeedle(ni needleIndex) (*Needle, error) {
+func (hs *Haystack) readNeedle(ni *needleIndex) (*Needle, error) {
 	needle := newNeedle(hs, ni.offset)
 
 	hs.dataFile.Seek(ni.offset, io.SeekStart)
@@ -308,6 +321,7 @@ func (hs *Haystack) writeNeedle(needle *Needle) error {
 	return nil
 }
 
+// NewNeedle creates a new needle at the end of the haystack
 func (hs *Haystack) NewNeedle(filename string, maxSize int64) (*Needle, error) {
 	keyH := fnv.New64a()
 	if _, err := keyH.Write([]byte(filename)); err != nil {
@@ -315,6 +329,7 @@ func (hs *Haystack) NewNeedle(filename string, maxSize int64) (*Needle, error) {
 	}
 	key := keyH.Sum64()
 
+	// TODO: keep this needle
 	if _, exists := hs.needlesMap[key]; exists {
 		return nil, fmt.Errorf("key %v already exists", key)
 	}
@@ -325,7 +340,7 @@ func (hs *Haystack) NewNeedle(filename string, maxSize int64) (*Needle, error) {
 	}
 
 	hs.needles = append(hs.needles, *ni)
-	hs.needlesMap[n.Key] = *ni
+	hs.needlesMap[n.Key] = ni
 
 	err = hs.appendIndex(ni)
 	if err != nil {
@@ -341,24 +356,46 @@ func (hs *Haystack) NewNeedle(filename string, maxSize int64) (*Needle, error) {
 func (hs *Haystack) appendIndex(ni *needleIndex) error {
 	start, err := hs.indexFile.Seek(0, io.SeekEnd)
 
-	if err = binary.Write(hs.indexFile, binary.LittleEndian, ni.key); err != nil {
-		hs.indexFile.Truncate(start)
+	if err != nil {
 		return err
 	}
-	if err = binary.Write(hs.indexFile, binary.LittleEndian, ni.flags); err != nil {
-		hs.indexFile.Truncate(start)
-		return err
-	}
-	if err = binary.Write(hs.indexFile, binary.LittleEndian, ni.offset); err != nil {
-		hs.indexFile.Truncate(start)
-		return err
-	}
-	if err = binary.Write(hs.indexFile, binary.LittleEndian, ni.size); err != nil {
+
+	if err = hs.writeIndex(ni); err != nil {
 		hs.indexFile.Truncate(start)
 		return err
 	}
 
 	return nil
+}
+
+func (hs *Haystack) updateIndex(ni *needleIndex) error {
+	_, err := hs.indexFile.Seek(ni.indexOffset, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	if err = hs.writeIndex(ni); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (hs *Haystack) writeIndex(ni *needleIndex) (err error) {
+	if err = binary.Write(hs.indexFile, binary.LittleEndian, ni.key); err != nil {
+		return
+	}
+	if err = binary.Write(hs.indexFile, binary.LittleEndian, ni.flags); err != nil {
+		return
+	}
+	if err = binary.Write(hs.indexFile, binary.LittleEndian, ni.offset); err != nil {
+		return
+	}
+	if err = binary.Write(hs.indexFile, binary.LittleEndian, ni.size); err != nil {
+		return
+	}
+
+	return
 }
 
 // TODO: fix up these to act more like file io
@@ -394,6 +431,7 @@ func (n *Needle) Write(b []byte) (int, error) {
 	return nb, err
 }
 
+// Finalize writes the checksum and flags to the needle and index
 func (n *Needle) Finalize() error {
 	if !n.invalidHash {
 		// finalize hash and remove PARTIAL
@@ -401,7 +439,18 @@ func (n *Needle) Finalize() error {
 		n.Flags &^= PARTIAL
 	}
 
-	return n.hs.writeNeedle(n)
+	err := n.hs.writeNeedle(n)
+	if err != nil {
+		return err
+	}
+
+	ni := n.hs.needlesMap[n.Key]
+	if ni.flags&PARTIAL == PARTIAL {
+		ni.flags &^= PARTIAL
+		return n.hs.writeIndex(ni)
+	}
+
+	return nil
 }
 
 // Seek will invalid the partial hash
