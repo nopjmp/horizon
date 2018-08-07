@@ -78,9 +78,21 @@ const needleIndexLen = 8 + 8 + 8 + 8
 const needleHeaderLen = 4 + 8 + 8 + 8
 const needleFooterLen = 4 + 8 // footer has padding after
 
+// assume we won't get odd errors
+func fileExists(filename string) bool {
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
 // NewHaystack creates a new Haystack, tries to recover index if it doesn't exist
 func NewHaystack(stackFile string) (*Haystack, error) {
 	indexFile := stackFile + ".idx"
+
+	if fileExists(stackFile) && !fileExists(indexFile) {
+		recoverIndex(stackFile)
+	}
 
 	f, err := os.OpenFile(indexFile, os.O_RDWR|os.O_CREATE, 0755)
 	if err != nil {
@@ -130,6 +142,10 @@ func NewHaystack(stackFile string) (*Haystack, error) {
 
 	h := Haystack{indexFile: f, dataFile: df, needles: needles, needlesMap: needlesMap}
 	return &h, nil
+}
+
+// TODO: iterate the haystack file and create a new index from scratch
+func recoverIndex(stackFile string) {
 }
 
 func newNeedle(hs *Haystack, offset int64) *Needle {
